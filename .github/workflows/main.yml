@@ -1,0 +1,234 @@
+# This workflow builds, tests, analyzes, deploys, and notifies.
+name: Build, Deploy, and Notify
+
+on:
+  push:
+    branches:
+      - main
+  # Add 'workflow_dispatch' to allow manual runs from the Actions tab
+  workflow_dispatch:
+
+# Global environment variables
+# MAVEN_USERNAME will be the GitHub user who triggered the action
+env:
+  MAVEN_USERNAME: ${{ github.actor }}
+
+jobs:
+  # Job 1: Build and Test
+  build-and-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Required for SonarQube analysis
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: 17
+          distribution: 'zulu'
+
+      - name: Cache SonarQube packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.sonar/cache
+          key: ${{ runner.os }}-sonar
+          restore-keys: ${{ runner.os }}-sonar
+
+      - name: Cache Maven packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2
+
+      - name: Create Maven settings.xml
+        run: |
+          echo "<settings xmlns='http://maven.apache.org/SETTINGS/1.0.0'
+            xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance'
+            xsi:schemaLocation='http://maven.apache.org/SETTINGS/1.0.0
+                                http://maven.apache.org/xsd/settings-1.0.0.xsd'>
+            <activeProfiles>
+              <activeProfile>github</activeProfile>
+            </activeProfiles>
+            <profiles>
+              <profile>
+                <id>github</id>
+                <repositories>
+                  <repository>
+                    <id>central</id>
+                    <url>https://repo1.maven.org/maven2</url>
+                  </repository>
+                  <repository>
+                    <id>github</id>
+                    <url>https://maven.pkg.github.com/${{ github.repository_owner }}</url>
+                    <snapshots>
+                      <enabled>true</enabled>
+                    </snapshots>
+                  </repository>
+                </repositories>
+              </profile>
+            </profiles>
+            <servers>
+              <server>
+                <id>github</id>
+                <username>${{ env.MAVEN_USERNAME }}</username>
+                <password>${{ secrets.MAVEN_PASSWORD }}</password>
+              </server>
+            </servers>
+          </settings>" > settings.xml
+        # We use secrets.MAVEN_PASSWORD, which you must create in your repo.
+
+      - name: Build and run tests
+        # This command runs the 'verify' phase, which compiles, tests, and packages
+        run: mvn -B -s settings.xml verify
+
+      - name: Upload artifact for analysis and deployment
+        # This stores the 'target' directory, which contains
+        # compiled code, test reports, and the .jar file
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifact
+          path: target
+
+  # Job 2: Analyze
+  analyze:
+    name: Analyze with SonarQube
+    runs-on: ubuntu-latest
+    # This job 'needs' the first one, so it will only run if
+    # 'build-and-test' succeeds.
+    needs: build-and-test
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Sonar needs the source code
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: 17
+          distribution: 'zulu'
+      
+      - name: Cache SonarQube packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.sonar/cache
+          key: ${{ runner.os }}-sonar
+          restore-keys: ${{ runner.os }}-sonar
+
+      - name: Cache Maven packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2
+
+      - name: Download artifact
+        # This gets the 'target' directory from the previous job
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifact
+          path: target # Re-create the target directory
+
+      - name: Analyze with SonarQube
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        # This command now uses the existing classes and test reports
+        # from the downloaded artifact, so it doesn't need to re-build/re-test.
+        run: >
+          mvn -B org.sonarsource.scanner.maven:sonar-maven-plugin:sonar 
+          -Dsonar.projectKey=java-app 
+          -Dsonar.projectName='java-app'
+
+  # Job 3: Deploy to GitHub Packages
+  deploy-to-github-packages:
+    name: Deploy to GitHub Packages
+    runs-on: ubuntu-latest
+    # This job 'needs' the 'analyze' job.
+    # The dependency chain is now: Deploy -> Analyze -> Build&Test
+    needs: analyze
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: 17
+          distribution: 'zulu'
+      
+      - name: Cache Maven packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2
+
+      - name: Create Maven settings.xml
+        run: |
+          echo "<settings xmlns='http://maven.apache.org/SETTINGS/1.0.0'
+            xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance'
+            xsi:schemaLocation='http://maven.apache.org/SETTINGS/1.0.0
+                                http://maven.apache.org/xsd/settings-1.0.0.xsd'>
+            <servers>
+              <server>
+                <id>github</id>
+                <username>${{ env.MAVEN_USERNAME }}</username>
+                <password>${{ secrets.MAVEN_PASSWORD }}</password>
+              </server>
+            </servers>
+          </settings>" > settings.xml
+
+      - name: Deploy package with Maven
+        # This will re-run the package lifecycle, but that's okay.
+        # It's simple, robust, and uses the cache.
+        run: mvn -B -s settings.xml deploy
+
+  # Job 4: Send Email Notification
+  notify:
+    name: Send Email Notification
+    runs-on: ubuntu-latest
+    # This job 'needs' all previous jobs to finish
+    needs: [build-and-test, analyze, deploy-to-github-packages]
+    # This 'if: always()' condition ensures this job runs
+    # even if any job fails.
+    if: always() 
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }} # e.g., 'us-east-1'
+
+      - name: Send email using AWS SES
+        uses: peter-evans/ses-send-email@v1
+        with:
+          from-email-address: ${{ secrets.AWS_SES_FROM_EMAIL }}
+          to-email-addresses: ${{ secrets.AWS_SES_TO_EMAIL }}
+          # The subject line now reports on all 3 jobs
+          subject: >
+            GitHub Actions Run ${{ github.run_number }} (Build: ${{ needs.build-and-test.result }}, Analyze: ${{ needs.analyze.result }}, Deploy: ${{ needs.deploy-to-github-packages.result }})
+          # The email body now reports on all 3 jobs
+          body: |
+            A GitHub Actions workflow has completed for repository: ${{ github.repository }}
+
+            Workflow name: ${{ github.workflow }}
+            Commit: ${{ github.sha }}
+            Triggered by: ${{ github.actor }}
+
+            Job Statuses:
+            - Build & Test: ${{ needs.build-and-test.result }}
+            - Analyze: ${{ needs.analyze.result }}
+            - Deploy to Packages: ${{ needs.deploy-to-github-packages.result }}
+
+            View the full workflow run here:
+            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
